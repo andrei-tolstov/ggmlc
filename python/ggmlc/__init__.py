@@ -39,7 +39,9 @@ from ggmlc.runtime.runner import ModelRunner, get_available_devices, load
 __version__ = "0.1.0"
 
 __all__ = [
+    "CompileOptions",
     "DType",
+    "FusionOptions",
     "Graph",
     "ModelRunner",
     "OpCode",
@@ -48,6 +50,7 @@ __all__ = [
     "codegen",
     "compile",
     "compile_to_bytes",
+    "compile_to_graph",
     "generate_cpp_project",
     "get_available_devices",
     "graph_to_mermaid",
@@ -58,10 +61,14 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:
     """Lazy-loads compiler, IR, codegen, and visualization modules on demand."""
-    if name in ("compile", "compile_to_bytes", "codegen"):
+    if name in ("compile", "compile_to_bytes", "compile_to_graph", "codegen", "CompileOptions"):
         import ggmlc.compiler as compiler_mod
 
         return getattr(compiler_mod, name)
+    if name == "FusionOptions":
+        from ggmlc.transforms.fusion import FusionOptions
+
+        return FusionOptions
     if name == "generate_cpp_project":
         import ggmlc.codegen as codegen_mod
 

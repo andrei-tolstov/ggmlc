@@ -2,15 +2,137 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ggmlc.codegen.cpp import generate_cpp_project
-from ggmlc.dialect.ggml.lowering import lower_to_ggml
+from ggmlc.dialect.ggml.lowering import GGMLExecutionGraph, lower_to_ggml
 from ggmlc.ir.dtype import DType
 from ggmlc.ir.graph import Graph
 from ggmlc.quantization import quantize_graph_parameters
 from ggmlc.transforms import create_standard_optimization_pipeline
+from ggmlc.transforms.fusion import FusionOptions
+
+
+@dataclass
+class CompileOptions:
+    """Structured configuration options for compiling models in ggmlc."""
+
+    model_name: str = "model"
+    enable_optimizations: bool = True
+    enable_fusion: bool = True
+    fusion_options: FusionOptions | dict[str, bool] | None = None
+    quantize: str | DType | None = None
+    dynamic_shapes: tuple[dict[int, Any], ...] | dict[str, Any] | None = None
+    extra_metadata: dict[str, Any] | None = None
+    tasks: str | list[str] | None = None
+
+
+def compile_to_graph(
+    model: Any,
+    sample_inputs: tuple[Any, ...] | list[Any] | None = None,
+    dynamic_shapes: tuple[dict[int, Any], ...] | dict[str, Any] | None = None,
+    model_name: str = "model",
+    enable_optimizations: bool = True,
+    enable_fusion: bool = True,
+    fusion_options: FusionOptions | dict[str, bool] | None = None,
+    quantize: str | DType | None = None,
+    release_module_storage: bool = False,
+    **kwargs: Any,
+) -> GGMLExecutionGraph:
+    """Ingests, optimizes, and lowers a neural network model into a GGMLExecutionGraph.
+
+    This function serves as the single authoritative frontend pipeline for both
+    direct GGUF binary serialization (ggmlc.compile) and standalone C++ code
+    generation (ggmlc.codegen), guaranteeing identical ingestion, canonical IR
+    optimizations, and GGML lowering across both compilation targets.
+    """
+    opts = FusionOptions.from_dict(fusion_options)
+
+    # 1. Ingest model into Canonical IR Graph
+    canonical_graph: Graph
+    if isinstance(model, Graph):
+        canonical_graph = model
+    elif hasattr(model, "main_graph") and isinstance(model.main_graph, Graph):
+        canonical_graph = model.main_graph
+    elif hasattr(model, "graph_module") or hasattr(model, "module"):  # ExportedProgram or nn.Module
+        from ggmlc.frontend.pytorch import export_torch_model
+
+        if sample_inputs is None:
+            raise ValueError("sample_inputs must be provided when compiling a PyTorch model.")
+        inputs_tuple = tuple(sample_inputs) if isinstance(sample_inputs, list) else sample_inputs
+        exported = export_torch_model(
+            model,
+            inputs_tuple,
+            dynamic_shapes=dynamic_shapes,
+            model_name=model_name,
+            enable_fusion=enable_fusion,
+            fusion_options=opts,
+            release_module_storage=release_module_storage,
+        )
+        canonical_graph = exported.main_graph
+    elif hasattr(model, "eqns"):  # JAX ClosedJaxpr
+        from ggmlc.frontend.jax.importer import import_jaxpr
+
+        canonical_graph = import_jaxpr(model, graph_name=model_name)
+    elif callable(model) and not hasattr(model, "parameters"):  # JAX function or callable
+        import jax
+
+        from ggmlc.frontend.jax import import_jaxpr
+
+        if sample_inputs is None:
+            raise ValueError("sample_inputs must be provided when compiling a JAX function.")
+        inputs_tuple = tuple(sample_inputs) if isinstance(sample_inputs, list) else sample_inputs
+        jaxpr = jax.make_jaxpr(model)(*inputs_tuple)
+        import_kwargs = {k: v for k, v in kwargs.items() if k not in ("device", "n_threads")}
+        canonical_graph = import_jaxpr(jaxpr, graph_name=model_name, **import_kwargs)
+    else:
+        # Fallback PyTorch export attempt
+        from ggmlc.frontend.pytorch import export_torch_model
+
+        if sample_inputs is None:
+            raise ValueError("sample_inputs must be provided for model compilation.")
+        inputs_tuple = tuple(sample_inputs) if isinstance(sample_inputs, list) else sample_inputs
+        exported = export_torch_model(
+            model,
+            inputs_tuple,
+            dynamic_shapes=dynamic_shapes,
+            model_name=model_name,
+            enable_fusion=enable_fusion,
+            fusion_options=opts,
+            release_module_storage=release_module_storage,
+        )
+        canonical_graph = exported.main_graph
+
+    canonical_graph.name = model_name
+
+    # 2. Run Canonical IR Graph Optimizations
+    if enable_optimizations:
+        opt_pipeline = create_standard_optimization_pipeline(
+            enable_fusion=enable_fusion, options=opts
+        )
+        opt_result = opt_pipeline.run(canonical_graph)
+        canonical_graph = opt_result.graph
+
+    # 3. Lower to GGML Dialect
+    ggml_graph = lower_to_ggml(
+        canonical_graph,
+        enable_fusion=enable_fusion,
+        fusion_options=opts,
+    )
+
+    # 4. Apply Block Quantization (Optional)
+    if quantize is not None:
+        if release_module_storage:
+            import gc
+
+            for tensor in canonical_graph.tensors.values():
+                tensor.data = None
+            gc.collect()
+        ggml_graph, _ = quantize_graph_parameters(ggml_graph, target_dtype=quantize)
+
+    return ggml_graph
 
 
 def compile(
@@ -21,7 +143,7 @@ def compile(
     model_name: str = "model",
     enable_optimizations: bool = True,
     enable_fusion: bool = True,
-    fusion_options: dict[str, bool] | None = None,
+    fusion_options: FusionOptions | dict[str, bool] | None = None,
     quantize: str | DType | None = None,
     return_runner: bool = False,
     pipeline: Any = None,
@@ -68,98 +190,20 @@ def compile(
     """
     release_module_storage = bool(kwargs.pop("release_module_storage", False))
 
-    # Normalize fusion_options before export so the PyTorch exporter does not
-    # bake in default horizontal fusion that later A/B flags cannot undo.
-    from ggmlc.transforms.fusion import FusionOptions as _FusionOptions
-
-    if fusion_options is None or isinstance(fusion_options, _FusionOptions):
-        pass
-    elif isinstance(fusion_options, dict):
-        normalized = _FusionOptions()
-        for k, v in fusion_options.items():
-            if hasattr(normalized, k):
-                setattr(normalized, k, v)
-        fusion_options = normalized
-    else:
-        raise TypeError(f"fusion_options must be FusionOptions or dict, got {type(fusion_options)}")
-
-    # 1. Ingest model into Canonical IR Graph
-    canonical_graph: Graph
-    if isinstance(model, Graph):
-        canonical_graph = model
-    elif hasattr(model, "graph_module") or hasattr(model, "module"):  # ExportedProgram or nn.Module
-        from ggmlc.frontend.pytorch import export_torch_model
-
-        if sample_inputs is None:
-            raise ValueError("sample_inputs must be provided when compiling a PyTorch model.")
-        inputs_tuple = tuple(sample_inputs) if isinstance(sample_inputs, list) else sample_inputs
-        exported = export_torch_model(
-            model,
-            inputs_tuple,
-            dynamic_shapes=dynamic_shapes,
-            model_name=model_name,
-            enable_fusion=enable_fusion,
-            fusion_options=fusion_options,
-            release_module_storage=release_module_storage,
-        )
-        canonical_graph = exported.main_graph
-    elif callable(model) and not hasattr(model, "parameters"):  # JAX function or callable
-        import jax
-
-        from ggmlc.frontend.jax import import_jaxpr
-
-        if sample_inputs is None:
-            raise ValueError("sample_inputs must be provided when compiling a JAX function.")
-        inputs_tuple = tuple(sample_inputs) if isinstance(sample_inputs, list) else sample_inputs
-        jaxpr = jax.make_jaxpr(model)(*inputs_tuple)
-        import_kwargs = {k: v for k, v in kwargs.items() if k not in ("device", "n_threads")}
-        canonical_graph = import_jaxpr(jaxpr, graph_name=model_name, **import_kwargs)
-    else:
-        # Fallback PyTorch export attempt
-        from ggmlc.frontend.pytorch import export_torch_model
-
-        if sample_inputs is None:
-            raise ValueError("sample_inputs must be provided for model compilation.")
-        inputs_tuple = tuple(sample_inputs) if isinstance(sample_inputs, list) else sample_inputs
-        exported = export_torch_model(
-            model,
-            inputs_tuple,
-            dynamic_shapes=dynamic_shapes,
-            model_name=model_name,
-            enable_fusion=enable_fusion,
-            fusion_options=fusion_options,
-            release_module_storage=release_module_storage,
-        )
-        canonical_graph = exported.main_graph
-
-    canonical_graph.name = model_name
-
-    # 2. Run Canonical IR Graph Optimizations
-    if enable_optimizations:
-        opt_pipeline = create_standard_optimization_pipeline(
-            enable_fusion=enable_fusion, options=fusion_options
-        )
-        opt_result = opt_pipeline.run(canonical_graph)
-        canonical_graph = opt_result.graph
-
-    # 3. Lower to GGML Dialect
-    ggml_graph = lower_to_ggml(
-        canonical_graph,
+    ggml_graph = compile_to_graph(
+        model=model,
+        sample_inputs=sample_inputs,
+        dynamic_shapes=dynamic_shapes,
+        model_name=model_name,
+        enable_optimizations=enable_optimizations,
         enable_fusion=enable_fusion,
         fusion_options=fusion_options,
+        quantize=quantize,
+        release_module_storage=release_module_storage,
+        **kwargs,
     )
 
-    # 4. Apply Block Quantization (Optional)
-    if quantize is not None:
-        if release_module_storage:
-            import gc
-
-            for tensor in canonical_graph.tensors.values():
-                tensor.data = None
-            gc.collect()
-        ggml_graph, _ = quantize_graph_parameters(ggml_graph, target_dtype=quantize)
-
-    # 5. Extract metadata from pipeline and tasks if provided
+    # Extract metadata from pipeline and tasks if provided
     combined_metadata: dict[str, Any] = dict(extra_metadata or {})
     if pipeline is not None:
         if hasattr(pipeline, "to_gguf_metadata"):
@@ -171,7 +215,7 @@ def compile(
         task_list = [tasks] if isinstance(tasks, str) else [str(t) for t in tasks]
         combined_metadata["ggmlc.tasks"] = task_list
 
-    # 6. Stream directly to file or serialize to memory
+    # Stream directly to file or serialize to memory
     from ggmlc.runtime.runner import load
     from ggmlc.serialization.gguf import save_to_gguf, serialize_to_gguf
 
@@ -186,10 +230,9 @@ def compile(
             from ggmlc.frontend.pytorch.exporter import cleanup_released_storage
             from ggmlc.serialization.spill import cleanup_spills
 
-            for graph in (canonical_graph, ggml_graph):
-                for tensor in getattr(graph, "tensors", {}).values():
-                    tensor.data = None
-            del canonical_graph, ggml_graph
+            for tensor in getattr(ggml_graph, "tensors", {}).values():
+                tensor.data = None
+            del ggml_graph
             gc.collect()
             cleanup_released_storage()
             cleanup_spills()
@@ -211,7 +254,7 @@ def compile_to_bytes(
     model_name: str = "model",
     enable_optimizations: bool = True,
     enable_fusion: bool = True,
-    fusion_options: dict[str, bool] | None = None,
+    fusion_options: FusionOptions | dict[str, bool] | None = None,
     quantize: str | DType | None = None,
     **kwargs: Any,
 ) -> bytes:
@@ -237,11 +280,13 @@ def codegen(
     model: Any,
     sample_inputs: tuple[Any, ...] | list[Any],
     output_dir: str | Path,
-    dynamic_shapes: tuple[dict[int, Any], ...] | None = None,
+    dynamic_shapes: tuple[dict[int, Any], ...] | dict[str, Any] | None = None,
     model_name: str = "model",
     enable_optimizations: bool = True,
     enable_fusion: bool = True,
-    fusion_options: dict[str, bool] | None = None,
+    fusion_options: FusionOptions | dict[str, bool] | None = None,
+    quantize: str | DType | None = None,
+    **kwargs: Any,
 ) -> Path:
     """Transpiles a neural network graph into a standalone, human-readable C++ project.
 
@@ -249,7 +294,7 @@ def codegen(
     and CMakeLists.txt ready for native compilation.
 
     Args:
-        model: PyTorch model or exported program.
+        model: PyTorch model, JAX callable, or IR Graph.
         sample_inputs: Sample input tensors matching model input signature.
         output_dir: Destination directory for the generated C++ project.
         dynamic_shapes: Optional dynamic shape constraints.
@@ -257,60 +302,22 @@ def codegen(
         enable_optimizations: If True, applies standard IR optimizations.
         enable_fusion: If True, lowers composite subgraphs to fused ops.
         fusion_options: Optional granular fusion options.
+        quantize: Optional quantization format ('f16', 'q4_0', 'q8_0', etc.).
+        **kwargs: Additional frontend export keyword arguments.
 
     Returns:
         Path to the generated project directory.
     """
-    from ggmlc.dialect.ggml.lowering import FusionOptions, lower_to_ggml
-    from ggmlc.ir.graph import Graph
-
-    inputs_tuple = tuple(sample_inputs) if isinstance(sample_inputs, list) else sample_inputs
-
-    if isinstance(model, Graph):
-        canonical_graph = model
-    elif hasattr(model, "eval") or (
-        isinstance(model, type) or (callable(model) and hasattr(model, "state_dict"))
-    ):
-        try:
-            from ggmlc.frontend.pytorch import export_torch_model
-
-            exported = export_torch_model(
-                model, inputs_tuple, dynamic_shapes=dynamic_shapes, model_name=model_name
-            )
-            canonical_graph = exported.main_graph
-        except (AttributeError, TypeError, ImportError, RuntimeError):
-            from ggmlc.frontend.jax.exporter import export_jax_fn
-
-            exported = export_jax_fn(model, inputs_tuple, model_name=model_name)
-            canonical_graph = exported.main_graph
-    elif hasattr(model, "eqns"):  # JAX ClosedJaxpr
-        from ggmlc.frontend.jax.importer import import_jaxpr
-
-        canonical_graph = import_jaxpr(model, graph_name=model_name)
-    elif callable(model):
-        from ggmlc.frontend.jax.exporter import export_jax_fn
-
-        exported = export_jax_fn(model, inputs_tuple, model_name=model_name)
-        canonical_graph = exported.main_graph
-    else:
-        raise TypeError(f"Unsupported model type for codegen: {type(model)}")
-
-    f_opts = FusionOptions()
-    if fusion_options:
-        for k, v in fusion_options.items():
-            if hasattr(f_opts, k):
-                setattr(f_opts, k, v)
-
-    if enable_optimizations:
-        from ggmlc.transforms import create_standard_optimization_pipeline
-
-        pipeline = create_standard_optimization_pipeline()
-        canonical_graph = pipeline(canonical_graph)
-
-    ggml_graph = lower_to_ggml(
-        canonical_graph,
+    ggml_graph = compile_to_graph(
+        model=model,
+        sample_inputs=sample_inputs,
+        dynamic_shapes=dynamic_shapes,
+        model_name=model_name,
+        enable_optimizations=enable_optimizations,
         enable_fusion=enable_fusion,
-        fusion_options=f_opts,
+        fusion_options=fusion_options,
+        quantize=quantize,
+        **kwargs,
     )
 
     generate_cpp_project(
