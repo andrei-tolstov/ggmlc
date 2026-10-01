@@ -763,6 +763,21 @@ def import_exported_program(ep: ExportedProgram, graph_name: str = "main") -> Gr
         # Collect input tensor IDs and attributes
         input_tensor_ids: list[int] = []
         attributes: dict[str, Any] = {}
+        if hasattr(node.target, "__name__"):
+            attributes["source_op"] = f"aten.{node.target.__name__}"
+        else:
+            attributes["source_op"] = str(node.target)
+
+        if "nn_module_stack" in node.meta:
+            stack = node.meta["nn_module_stack"]
+            if isinstance(stack, dict) and stack:
+                mod_key = list(stack.keys())[-1]
+                mod_val = list(stack.values())[-1]
+                cls_name = ""
+                if isinstance(mod_val, tuple) and len(mod_val) >= 2:
+                    cls_obj = mod_val[1]
+                    cls_name = cls_obj.__name__ if hasattr(cls_obj, "__name__") else str(cls_obj)
+                attributes["module_path"] = f"{mod_key} ({cls_name})" if cls_name else str(mod_key)
 
         if opcode == OpCode.TRANSPOSE:
             # aten.transpose.int(self, dim0, dim1) or aten.t(self)

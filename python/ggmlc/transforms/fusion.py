@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from typing import Any
 
 import numpy as np
 
@@ -66,6 +67,40 @@ class FusionOptions:
     # Skips QK-Norm (norm→RoPE) and peri-norm residual (norm→residual ADD) so
     # stock CUDA fused kernels stay intact.
     enable_bake_affine: bool = True
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | FusionOptions | None) -> FusionOptions:
+        """Constructs and validates a FusionOptions instance.
+
+        Args:
+            d: Dictionary of option name to boolean, FusionOptions instance, or None.
+
+        Returns:
+            Validated FusionOptions instance.
+
+        Raises:
+            ValueError: If unrecognized fusion option keys are provided.
+            TypeError: If input is not a dict or FusionOptions.
+        """
+        if d is None:
+            return cls()
+        if isinstance(d, cls):
+            return d
+        if not isinstance(d, dict):
+            raise TypeError(f"Expected dict or FusionOptions, got {type(d).__name__}")
+
+        valid_fields = {f.name for f in fields(cls)}
+        unknown = set(d.keys()) - valid_fields
+        if unknown:
+            raise ValueError(
+                f"Unknown fusion option(s): {sorted(unknown)}. "
+                f"Valid options are: {sorted(valid_fields)}"
+            )
+        return cls(**{k: bool(v) for k, v in d.items()})
+
+    def to_dict(self) -> dict[str, bool]:
+        """Converts the options to a standard dictionary."""
+        return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
 class OperatorFusionPass(Pass):
@@ -553,7 +588,10 @@ def _fuse_layer_norm_patterns(graph: Graph) -> None:
                                 opcode=OpCode.LAYER_NORM,
                                 inputs=ln_inputs,
                                 outputs=list(op.outputs),
-                                attributes={"eps": eps},
+                                attributes={
+                                    "eps": eps,
+                                    "fused_pass": "LayerNorm Normalization Fusion",
+                                },
                                 name=f"{op.name or 'layer_norm'}_fused",
                             )
                             new_nodes.append(fused_op)
@@ -723,7 +761,7 @@ def _fuse_rms_norm_patterns(graph: Graph) -> None:
                             opcode=OpCode.RMS_NORM,
                             inputs=[x_id, gamma_id],
                             outputs=list(op.outputs),
-                            attributes={"eps": eps},
+                            attributes={"eps": eps, "fused_pass": "RMSNorm Normalization Fusion"},
                             name=f"{op.name or 'rms_norm'}_fused",
                         )
                         new_nodes.append(fused_op)
@@ -757,6 +795,7 @@ def _fuse_conv2d_relu_patterns(graph: Graph) -> None:
             ):
                 prod.attributes["fused_relu"] = True
                 prod.attributes["fused_activation"] = "relu"
+                prod.attributes["fused_pass"] = "Conv2D + ReLU Activation Fusion"
                 prod.outputs = list(op.outputs)
                 if op.outputs[0] in graph.tensors:
                     graph.tensors[op.outputs[0]].producer_id = prod.id
@@ -820,7 +859,10 @@ def _fuse_swiglu_patterns(graph: Graph) -> None:
                         opcode=OpCode.SWIGLU,
                         inputs=[gate_id, up_id],
                         outputs=list(op.outputs),
-                        attributes=dict(op.attributes),
+                        attributes={
+                            **dict(op.attributes),
+                            "fused_pass": "SwiGLU Activation Fusion (silu(gate) * up)",
+                        },
                         name=f"{op.name or 'swiglu'}_fused",
                     )
                     new_nodes.append(fused_op)
@@ -1360,6 +1402,7 @@ def _fuse_horizontal_linear_patterns(graph: Graph, options: FusionOptions) -> No
             opcode=OpCode.LINEAR,
             inputs=linear_inputs,
             outputs=[fused_act.id],
+            attributes={"fused_pass": f"Horizontal {tag.upper()} Projection Fusion"},
             name=f"linear_fused_{tag}_{d_in}_to_{total_out_dim}",
         )
         fused_act.producer_id = fused_linear_op.id
@@ -1373,7 +1416,13 @@ def _fuse_horizontal_linear_patterns(graph: Graph, options: FusionOptions) -> No
                 opcode=OpCode.SLICE,
                 inputs=[fused_act.id],
                 outputs=[op.outputs[0]],
-                attributes={"dim": -1, "start": curr_offset, "end": curr_offset + out_d, "step": 1},
+                attributes={
+                    "dim": -1,
+                    "start": curr_offset,
+                    "end": curr_offset + out_d,
+                    "step": 1,
+                    "fused_pass": f"Horizontal {tag.upper()} Slice Unpack",
+                },
                 name=f"slice_{op.name or tag}_{curr_offset}_{curr_offset + out_d}",
             )
             out_t = graph.get_tensor(op.outputs[0])

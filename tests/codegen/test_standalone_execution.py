@@ -270,6 +270,7 @@ def _run_standalone(model, example_args, test_name, ggml_libs, tmp_path, atol=1e
     print(f"got[0:8]: {got.ravel()[:8]}")
     print(f"max abs diff: {np.max(np.abs(got - ref_array.ravel()))}")
     np.testing.assert_allclose(got, ref_array.ravel(), atol=atol)
+    return got
 
 
 def test_standalone_linear_bias(ggml_standalone_libs, tmp_path):

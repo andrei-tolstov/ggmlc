@@ -2,6 +2,8 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
+from ggmlc import CompileOptions, FusionOptions
 from ggmlc.codegen import generate_cpp_project
 from ggmlc.dialect.ggml.lowering import lower_to_ggml
 from ggmlc.dialect.ggml.ops import GGMLOpCode
@@ -229,3 +231,105 @@ def test_lower_transpose_to_axis_attributes():
     (node,) = ggml_graph.nodes
     assert node.opcode == GGMLOpCode.GGML_OP_PERMUTE
     assert [node.attributes[f"axis{i}"] for i in range(4)] == [0, 2, 1, 3]
+
+
+def test_codegen_human_comments():
+    """Verify that generated C++ code includes rich, human-like architectural and op commentary."""
+    g = Graph("annotated_mlp")
+    x = g.add_tensor("x", Shape([1, 16]), DType.F32, StorageClass.INPUT)
+    w = g.add_tensor("w", Shape([16, 16]), DType.F32, StorageClass.PARAMETER)
+    b = g.add_tensor("b", Shape([16]), DType.F32, StorageClass.PARAMETER)
+    out = g.add_tensor("out", Shape([1, 16]), DType.F32, StorageClass.ACTIVATION)
+
+    w.data = np.eye(16, dtype=np.float32)
+    b.data = np.zeros((16,), dtype=np.float32)
+
+    g.add_node(
+        OpCode.LINEAR,
+        inputs=[x.id, w.id, b.id],
+        outputs=[out.id],
+        attributes={
+            "source_op": "aten.linear.default",
+            "module_path": "layers.0.fc (Linear)",
+            "fused_pass": "Fused Linear GEMM + Bias",
+        },
+        name="fc_layer",
+    )
+    g.inputs = [x.id]
+    g.outputs = [out.id]
+    g.parameters = [w.id, b.id]
+
+    ggml_graph = lower_to_ggml(g)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths = generate_cpp_project(ggml_graph, tmpdir, model_name="AnnotatedMLP")
+        header_text = paths["header"].read_text(encoding="utf-8")
+
+        # Top-level architecture summary comments
+        assert "// Model Architecture & Execution Graph: AnnotatedMLP" in header_text
+        assert "// Topology Summary:" in header_text
+        assert "//   - Declared Inputs" in header_text
+        assert "//   - Model Parameters" in header_text
+        assert "//   - Declared Outputs" in header_text
+        assert "//   - Computational Operations:" in header_text
+
+        # 4-phase execution flow comments
+        assert "// Phase 1: Bind Persistent Model Weights from Weights Struct" in header_text
+        assert "// Phase 2: Ingest and Validate Named Model Inputs" in header_text
+        assert "// Phase 3: Forward Execution Graph Nodes (Operations & Activations)" in header_text
+        assert "// Phase 4: Register Model Outputs with Graph Forward Expander" in header_text
+
+        # Per-node human-readable annotations
+        assert "// Node 0: fc_layer [GGML_OP_MUL_MAT]" in header_text
+        assert "// Semantics: Linear Projection / GEMM + Bias: y = x @ W^T + b" in header_text
+        assert "// Source Op: aten.linear.default" in header_text
+        assert "// PyTorch Module: layers.0.fc (Linear)" in header_text
+        assert "// Optimization Pass: Fused Linear GEMM + Bias" in header_text
+        assert "// Operands:" in header_text
+        assert '//   in[0]: tensors[1] ("w", Parameter, [16x16x1x1], GGML_TYPE_F32)' in header_text
+        assert '//   in[1]: tensors[0] ("x", Model Input, [16x1x1x1], GGML_TYPE_F32)' in header_text
+        assert (
+            '//   out[0]: tensors[3] ("out", Model Output, [16x1x1x1], GGML_TYPE_F32)'
+            in header_text
+        )
+        assert (
+            "// Lowering: GGML mul_mat consumes transposed weight as 1st argument (W, x); bias added after GEMM"
+            in header_text
+        )
+
+
+def test_fusion_options_typing_and_validation():
+    """Verify FusionOptions and CompileOptions dataclass typing and validation."""
+    # Default options
+    opts = FusionOptions()
+    assert opts.enable_swiglu is True
+    assert opts.enable_bias_gelu is True
+
+    # from_dict with valid options
+    custom = FusionOptions.from_dict({"enable_swiglu": False, "enable_bias_gelu": True})
+    assert custom.enable_swiglu is False
+    assert custom.enable_bias_gelu is True
+
+    # to_dict roundtrip
+    d = custom.to_dict()
+    assert isinstance(d, dict)
+    assert d["enable_swiglu"] is False
+    roundtrip = FusionOptions.from_dict(d)
+    assert roundtrip == custom
+
+    # from_dict rejects unknown keys with ValueError
+    with pytest.raises(ValueError, match="Unknown fusion option"):
+        FusionOptions.from_dict({"unknown_super_fusion": True})
+
+    # from_dict rejects non-dict with TypeError
+    with pytest.raises(TypeError, match="Expected dict or FusionOptions"):
+        FusionOptions.from_dict(42)  # type: ignore
+
+    # CompileOptions initialization
+    comp_opts = CompileOptions(
+        model_name="my_model",
+        enable_fusion=True,
+        fusion_options=custom,
+    )
+    assert comp_opts.model_name == "my_model"
+    assert comp_opts.fusion_options.enable_swiglu is False

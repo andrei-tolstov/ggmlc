@@ -16,6 +16,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(ggml CONFIG REQUIRED PATHS "${GGML_BUILD_DIR}" NO_DEFAULT_PATH)
 
 add_executable(standalone_test "${TEST_DRIVER_SRC}")
+set(STDLIB_SRC "${RT_INCLUDE_DIR}/../src/stdlib_kernels.cpp")
+if(EXISTS "${STDLIB_SRC}")
+    target_sources(standalone_test PRIVATE "${STDLIB_SRC}")
+endif()
+
 target_compile_definitions(standalone_test PRIVATE
     TEST_MODEL=${TEST_MODEL}
     TEST_HEADER=${TEST_MODEL}.h
@@ -24,4 +29,9 @@ target_include_directories(standalone_test PRIVATE
     "${MODEL_PROJ_DIR}"
     "${RT_INCLUDE_DIR}"
 )
+if (MSVC)
+    target_compile_options(standalone_test PRIVATE /openmp:experimental)
+endif()
 target_link_libraries(standalone_test PRIVATE ggml::ggml)
+
+
