@@ -129,8 +129,10 @@ public:
     bool is_cuda_graph_buckets_enabled() const { return enable_cuda_graph_buckets_; }
     bool is_cuda_graph_bucket_captured(int batch_size) const;
 
-private:
+    // Eagerly upload static parameters and constants to device memory
     void init_weights();
+
+private:
     void init_states(const std::unordered_map<std::string, int64_t>& symbol_env);
     bool has_state_tensors() const;
 

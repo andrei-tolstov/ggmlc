@@ -28,6 +28,9 @@
 #if defined(GGML_USE_VULKAN)
 #include "ggml-vulkan.h"
 #endif
+#if defined(__linux__)
+#include <malloc.h>
+#endif
 #include "ggmlc/stdlib_kernels.h"
 
 namespace ggmlc {
@@ -427,6 +430,40 @@ void ModelExecutor::init_weights() {
                 }
             }
         }
+    }
+
+    // Free host-side copy of weights if running on non-CPU accelerator (e.g. CUDA / Metal)
+    if (device_ != "cpu") {
+        std::vector<uint8_t> retained_constants;
+        std::unordered_map<uint32_t, size_t> retained_offsets;
+
+        for (const auto& pair : model_graph_.tensors) {
+            uint32_t tid = pair.first;
+            const auto& t = pair.second;
+            // Only preserve memory for non-PARAMETER tensors (e.g. dynamic arange or compute constants)
+            if (t.storage != StorageClass::PARAMETER && t.data_ptr && t.data_size > 0) {
+                retained_offsets[tid] = retained_constants.size();
+                retained_constants.insert(retained_constants.end(),
+                                          static_cast<const uint8_t*>(t.data_ptr),
+                                          static_cast<const uint8_t*>(t.data_ptr) + t.data_size);
+            }
+        }
+
+        model_graph_.data_buffer = std::move(retained_constants);
+
+        for (auto& pair : model_graph_.tensors) {
+            uint32_t tid = pair.first;
+            auto& t = pair.second;
+            if (t.storage == StorageClass::PARAMETER) {
+                t.data_ptr = nullptr;
+                t.data_size = 0;
+            } else if (retained_offsets.count(tid)) {
+                t.data_ptr = model_graph_.data_buffer.data() + retained_offsets[tid];
+            }
+        }
+#if defined(__linux__)
+        malloc_trim(0);
+#endif
     }
 
     weights_loaded_ = true;

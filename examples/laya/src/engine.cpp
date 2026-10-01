@@ -11,6 +11,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#if defined(__linux__)
+#include <malloc.h>
+#endif
 
 namespace laya {
 
@@ -113,6 +116,16 @@ bool DecisionEngine::load_model(const std::string& gguf_path, const EngineOption
     }
 
     if (cuda_graph_) executor_->set_enable_cuda_graph(true);
+
+    // Eagerly upload weights to GPU VRAM and release host memory immediately
+    executor_->init_weights();
+
+    // Free the redundant host-side GGUF data buffer in DecisionEngine
+    graph_.data_buffer.clear();
+    graph_.data_buffer.shrink_to_fit();
+#if defined(__linux__)
+    malloc_trim(0);
+#endif
 
     loaded_ = true;
     std::cerr << "[laya] ready  kind=" << recipe_.kind
